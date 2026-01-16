@@ -1,159 +1,218 @@
-import cv2
+import streamlit as st
+import cv2  
 import numpy as np
-import os
-import glob
+import pywt
+import cv2
+from PIL import Image
+import matplotlib.pyplot as plt
 
+from utils.text_bin import text_to_bin, bin_to_text
+from algorithms.dwt import apply_dwt, apply_idwt  
 
-class IWTSteganography:
-    def __init__(self):
-        self.channel_to_use = 0
-        self.DELIMITER = '1111111111111110'
+def embed_bits_in_subband(subband, binary_messages):
 
-    def _text_to_binary(self, text):
-        binary_str = ''.join(format(ord(char), '08b') for char in text)
-        return binary_str + self.DELIMITER
+    flat_subband = subband.flatten()
+    modified_subband = flat_subband.copy()
 
-    def _binary_to_text(self, binary_str):
-        chars = []
-        for i in range(0, len(binary_str), 8):
-            byte = binary_str[i:i + 8]
-            if len(byte) == 8:
-                chars.append(chr(int(byte, 2)))
-        return ''.join(chars)
+    msg_len = len(binary_messages)
 
-    def _iwt_haar_forward(self, block):
-        block = block.astype(np.int32)
-        even = block[0::2]
-        odd = block[1::2]
-        d = odd - even
-        s = even + (d // 2)
-        return s, d
+    bin_len = format(msg_len, '032b')
+    full_message = bin_len + binary_messages
 
-    def _iwt_haar_inverse(self, s, d):
-        even = s - (d // 2)
-        odd = d + even
-        reconstructed = np.zeros(len(s) + len(d), dtype=np.int32)
-        reconstructed[0::2] = even
-        reconstructed[1::2] = odd
-        return reconstructed
+    if (len(full_message) > len(flat_subband)):
+        st.error(f"Message too long to embed in the selected subband. Need {len(full_message)} bits, but only {len(flat_subband)} available.")
+        return subband, False
+    
+    for i in range(len(full_message)):
+        val = int(modified_subband[i])
+        bit = int(full_message[i])
 
-    def embed_data(self, image_path, secret_data, output_folder="output_DWT"):
-        img = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
-        if img is None:
-            print(f"[Lỗi] Không đọc được ảnh: {image_path}")
-            return None
+        new_val = (val & ~1) | bit 
 
-        if img.ndim == 2:
-            is_grayscale = True
-            height, width = img.shape
-            channel_data = img
+        modified_subband[i] = float(new_val)
+
+    return modified_subband.reshape(subband.shape), True
+    
+def extract_bits_from_subband(subband):
+
+    flat_subband = subband.flatten()
+    extracted_bits = ""
+
+    for i in range(32):
+        val = int(flat_subband[i])
+        extracted_bits += str(val & 1)
+
+    try:
+
+        msg_len = int(extracted_bits, 2)
+    except:
+        return "Failed to extract message length."
+
+    message_bits = ""
+
+    for i in range(32,32 + msg_len):
+        if i >= len (flat_subband): break
+        val = int(flat_subband[i])
+        message_bits += str(val & 1)
+
+    return bin_to_text(message_bits)
+
+def plot_frequency_domain(coeffs, title="Frequency Domain with DWT"):
+
+    LL, (LH, HL, HH) = coeffs
+    
+    def normalize(arr):
+        arr = np.abs(arr)
+        arr = (arr - np.min(arr)) / (np.max(arr) - np.min(arr) + 1e-5) * 255
+        return arr.astype(np.uint8)
+
+    fig, axes = plt.subplots(2, 2, figsize=(6, 6))
+    ax = axes.ravel()
+    
+    ax[0].imshow(normalize(LL), cmap='gray')
+    ax[0].set_title("LL (Low-Freq)\nApproximation")
+    
+    ax[1].imshow(normalize(LH), cmap='gray')
+    ax[1].set_title("LH (Horizontal)")
+    
+    ax[2].imshow(normalize(HL), cmap='gray')
+    ax[2].set_title("HL (Vertical)")
+    
+    ax[3].imshow(normalize(HH), cmap='gray')
+    ax[3].set_title("HH (Diagonal)\nSecret Data Here")
+    
+    for a in ax: a.axis('off')
+    plt.tight_layout()
+    return fig
+
+st.title("Digital Image Steganography in Transform Domain using DWT")
+
+with st.sidebar:
+    st.header("Algorithm Configuration")
+    image_mode = st.radio("Image type", ["Grayscale", "Color (RGB)"], index=1)
+
+    color_space = None
+    if image_mode == "Color (RGB)":
+        color_space = st.selectbox("Color Space for Embedding", ["RGB (Embed in Blue channel)", "YCbCr (Embed in Cb channel)"], help="YCbCr may provide better imperceptibility because human vision is less sensitive to chrominance changes.")
+
+    secret_msg = st.text_area("Secret Message to Embed", "Hello, this is a secret message!")
+    st.info("Note: Message will be embed in the high-frequency HH subband of the selected color channel.")
+
+uploaded_file = st.file_uploader("Upload an Image (PNG, JPG, JPEG, TIFF)", type=['png', 'jpg', 'jpeg', 'tif', 'tiff'])
+
+if uploaded_file and secret_msg:
+
+    image_pil = Image.open(uploaded_file)
+    image_np = np.array(image_pil)
+    
+    st.subheader("1. Analysis and Embedding Process")
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        st.image(image_pil, caption="Original Image", use_container_width=True)
+
+    stego_image_np = None
+    coeffs_original = None
+    coeffs_stego = None
+    extracted_text = ""
+    
+    if image_mode == "Grayscale":
+
+        if len(image_np.shape) == 3:
+            gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
         else:
-            is_grayscale = False
-            height, width, channels = img.shape
-            channel_data = img[:, :, self.channel_to_use]
+            gray = image_np
+            
+        # DWT Transform
+        coeffs = apply_dwt(gray)
+        coeffs_original = coeffs 
+        LL, (LH, HL, HH) = coeffs
+        
+        # Embedding
+        bin_msg = text_to_bin(secret_msg)
+        HH_new, success = embed_bits_in_subband(HH, bin_msg)
+        
+        if success:
+            coeffs_mod = (LL, (LH, HL, HH_new))
+            coeffs_stego = coeffs_mod
+            
+            # IDWT Reconstruction
+            stego_float = apply_idwt(coeffs_mod)
+            stego_image_np = np.clip(stego_float, 0, 255).astype(np.uint8)
+            
+            # Extraction simulation
+            extracted_text = extract_bits_from_subband(HH_new)
 
-        if height % 2 != 0: height -= 1
-        if width % 2 != 0: width -= 1
-
-        channel_data = channel_data[:height, :width]
-
-        binary_secret = self._text_to_binary(secret_data)
-        data_len = len(binary_secret)
-
-        flat_pixels = channel_data.flatten()
-        s, d = self._iwt_haar_forward(flat_pixels)
-
-        if data_len > len(d):
-            print(f"[Lỗi] Ảnh {os.path.basename(image_path)} quá nhỏ!")
-            return None
-
-        d_modified = d.copy()
-        for i in range(data_len):
-            d_modified[i] = (d_modified[i] & ~1) | int(binary_secret[i])
-
-        reconstructed_flat = self._iwt_haar_inverse(s, d_modified)
-        reconstructed_channel = reconstructed_flat.reshape((height, width))
-        reconstructed_channel = np.clip(reconstructed_channel, 0, 255).astype(np.uint8)
-
-        if is_grayscale:
-            stego_img = reconstructed_channel
+    else: 
+        if "YCbCr" in color_space:
+            # Chuyển đổi RGB -> YCbCr
+            img_ycbcr = cv2.cvtColor(image_np, cv2.COLOR_RGB2YCrCb)
+            Y, Cr, Cb = cv2.split(img_ycbcr)
+            
+            coeffs = apply_dwt(Cb)
+            coeffs_original = coeffs
+            LL, (LH, HL, HH) = coeffs
+            
+            bin_msg = text_to_bin(secret_msg)
+            HH_new, success = embed_bits_in_subband(HH, bin_msg)
+            
+            if success:
+                coeffs_mod = (LL, (LH, HL, HH_new))
+                coeffs_stego = coeffs_mod
+                
+                Cb_new_float = apply_idwt(coeffs_mod)
+                Cb_new = np.clip(Cb_new_float, 0, 255).astype(np.uint8)
+                
+                # Merge lại
+                stego_ycbcr = cv2.merge([Y, Cr, Cb_new])
+                stego_image_np = cv2.cvtColor(stego_ycbcr, cv2.COLOR_YCrCb2RGB)
+                extracted_text = extract_bits_from_subband(HH_new)
+                
         else:
-            stego_img = img[:height, :width, :].copy()
-            stego_img[:, :, self.channel_to_use] = reconstructed_channel
+            R, G, B = cv2.split(image_np)
+            
+            coeffs = apply_dwt(B)
+            coeffs_original = coeffs
+            LL, (LH, HL, HH) = coeffs
+            
+            bin_msg = text_to_bin(secret_msg)
+            HH_new, success = embed_bits_in_subband(HH, bin_msg)
+            
+            if success:
+                coeffs_mod = (LL, (LH, HL, HH_new))
+                coeffs_stego = coeffs_mod
+                
+                B_new_float = apply_idwt(coeffs_mod)
+                B_new = np.clip(B_new_float, 0, 255).astype(np.uint8)
+                
+                stego_image_np = cv2.merge([R, G, B_new])
+                extracted_text = extract_bits_from_subband(HH_new)
 
-        if not os.path.exists(output_folder):
-            os.makedirs(output_folder)
+    with col2:
+        if stego_image_np is not None:
+            st.image(stego_image_np, caption="Stego Image", use_container_width=True)
+            
+            # Tính PSNR
+            mse = np.mean((image_np.astype(float) - stego_image_np.astype(float)) ** 2)
+            psnr = 10 * np.log10(255.0**2 / mse) if mse > 0 else 100
+            st.metric("Image quality (PSNR)", f"{psnr:.2f} dB", help="Value >30dB is considered good.")
 
-        filename = os.path.basename(image_path)
-        name, ext = os.path.splitext(filename)
+    st.subheader("2. Compare Frequency Domain Before and After Embedding")
+    
+    if coeffs_original and coeffs_stego:
+        freq_col1, freq_col2 = st.columns(2)
+        with freq_col1:
+            st.write("Bẻoefore Embedding")
+            fig1 = plot_frequency_domain(coeffs_original)
+            st.pyplot(fig1)
+        
+        with freq_col2:
+            st.write("After Embedding")
+            fig2 = plot_frequency_domain(coeffs_stego)
+            st.pyplot(fig2)
 
-        # --- THAY ĐỔI Ở ĐÂY: Đổi tên file output thành _output_DWT ---
-        output_path = os.path.join(output_folder, f"{name}_output_DWT.png")
-
-        cv2.imwrite(output_path, stego_img)
-        return output_path
-
-    def extract_data(self, stego_image_path):
-        img = cv2.imread(stego_image_path, cv2.IMREAD_UNCHANGED)
-        if img is None:
-            return "Lỗi đọc file"
-
-        if img.ndim == 2:
-            channel_data = img
-        else:
-            channel_data = img[:, :, self.channel_to_use]
-
-        flat_pixels = channel_data.flatten()
-        s, d = self._iwt_haar_forward(flat_pixels)
-
-        binary_data = ""
-        delimiter_found = False
-
-        for val in d:
-            binary_data += str(val & 1)
-            if binary_data.endswith(self.DELIMITER):
-                binary_data = binary_data[:-len(self.DELIMITER)]
-                delimiter_found = True
-                break
-
-        if not delimiter_found:
-            return "[Cảnh báo] Không tìm thấy dấu hiệu kết thúc tin nhắn."
-
-        return self._binary_to_text(binary_data)
-
-
-if __name__ == "__main__":
-    INPUT_FOLDER = "input_images"
-
-    # --- THAY ĐỔI Ở ĐÂY: Đổi tên folder output ---
-    OUTPUT_FOLDER = "output_DWT"
-
-    SECRET_MESSAGE = "Xin chao! Day la mat ma bi mat su dung IWT."
-
-    tool = IWTSteganography()
-
-    if not os.path.exists(INPUT_FOLDER):
-        print(f"Lỗi: Không tìm thấy thư mục '{INPUT_FOLDER}'.")
-        exit()
-
-    types = ('*.png', '*.jpg', '*.jpeg', '*.bmp', '*.tif')
-    image_files = []
-    for files in types:
-        image_files.extend(glob.glob(os.path.join(INPUT_FOLDER, files)))
-
-    print(f"Tìm thấy {len(image_files)} ảnh trong thư mục '{INPUT_FOLDER}'.")
-    print("-" * 50)
-
-    for img_path in image_files:
-        print(f"-> Đang xử lý: {os.path.basename(img_path)}")
-
-        stego_path = tool.embed_data(img_path, SECRET_MESSAGE, OUTPUT_FOLDER)
-
-        if stego_path:
-            recovered_msg = tool.extract_data(stego_path)
-
-            if recovered_msg == SECRET_MESSAGE:
-                print(f"   [OK] File lưu tại: {stego_path}")
-            else:
-                print(f"   [FAIL] Dữ liệu sai lệch!")
-        print("-" * 50)
+    st.subheader("3. Extracted Secret Message")
+    st.success(f"Extract message from stego image **{extracted_text}**")
+    
+else:
+    st.info("Upload an image and enter a secret message to embed using DWT-based steganography.")
